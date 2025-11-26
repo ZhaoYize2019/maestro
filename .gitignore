@@ -1,0 +1,8 @@
+.vscode
+src/__pycache__
+COMPLETION_REPORT.md
+DESIGN.md
+INDEX.md
+maestro_trajectory.pkl
+Maestro仿真器.md
+QUICKSTART.md
