@@ -1,6 +1,8 @@
 import numpy as np
 import random
 from .rl_interface import IRLAgent, RLAction, RLReward
+import logging
+logger = logging.getLogger(__name__)
 
 
 class BehaviorAgent(IRLAgent):
@@ -26,13 +28,11 @@ class BehaviorAgent(IRLAgent):
         self.exploration_rate = 0.2  # 20% Random actions
 
     def get_action(self, state: np.ndarray) -> RLAction:
-        """
-        Select action based on behavior policy.
-        """
-        # Determine strategy: Random vs Frugal
         if random.random() < self.exploration_rate:
+            logger.info("Strategy: Random Exploration")
             return self._get_random_action()
         else:
+            # logger.info("Strategy: Frugal")
             return self._get_frugal_action()
 
     def _get_random_action(self) -> RLAction:

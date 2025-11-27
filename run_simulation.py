@@ -37,8 +37,6 @@ def main():
         # [新增 2] 开启轨迹保存功能 (离线 RL 必需)
         # 这样 simulator.py 的 cleanup() 才会把数据写入硬盘
         config.SAVE_TRAJECTORY = True
-        config.TRAJECTORY_FILE = "offline_rl_dataset_v1.pkl"
-
         # 可选：调整仿真时长
         # config.SIMULATION_DURATION = 1000.0
 
