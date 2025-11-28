@@ -1,334 +1,245 @@
 """
 Task Manager Module - Task Generation and Management
-Handles task type definitions, Poisson process task generation,
-and task attribute management
+Handles heterogeneous Poisson task streams generation and management.
 """
 
-import numpy as np
 import logging
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple, TYPE_CHECKING
-from abc import ABC, abstractmethod
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Tuple, Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .task_queue import Task
+    from .config import SimulationConfig
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class TaskType:
+class PoissonTaskStream:
     """
-    Task type definition containing attributes for a specific task category.
-    
-    Attributes:
-        name: Task type identifier (e.g., "sampling", "computing")
-        priority: Priority level [1, K]
-        max_delay: Maximum delay tolerance in seconds
-        required_nodes_range: Tuple (min, max) nodes needed
-        energy_threshold: Energy threshold in Volts
+    Represents an independent task stream (e.g., a specific IoT device).
+    Attributes are fixed at initialization to simulate device heterogeneity.
     """
-    name: str
-    priority: int
-    max_delay: float
-    required_nodes_range: Tuple[int, int]
-    energy_threshold: float
-    
-    def validate(self, num_nodes: int) -> bool:
-        """Validate task type configuration"""
-        assert self.priority > 0, "Priority must be positive"
-        assert self.max_delay > 0, "Max delay must be positive"
-        assert 0 < self.required_nodes_range[0] <= self.required_nodes_range[1] <= num_nodes, \
-            f"Invalid node range for {self.name}"
-        assert 1.8 <= self.energy_threshold <= 3.8, \
-            f"Energy threshold must be in [1.8, 3.8], got {self.energy_threshold}"
-        return True
+    stream_id: str          # Unique identifier, e.g., "stream_001"
+
+    # === Independent Attributes ===
+    lambda_rate: float      # Arrival rate (tasks per second)
+    mean_interval: float    # 1 / lambda_rate
+    priority: int           # Task priority level
+    required_nodes: int     # Number of nodes required
+    energy_threshold: float # Minimum energy threshold (Volts)
+    max_delay: float        # Maximum allowed delay (Deadline - Arrival Time)
+
+    # === Dynamic State ===
+    next_arrival_time: float = 0.0
+
+    @property
+    def name(self) -> str:
+        """Alias for stream_id to maintain compatibility with interfaces expecting 'name'."""
+        return self.stream_id
+
+    def schedule_next_arrival(self, current_time: float) -> None:
+        """
+        Calculate the next arrival time based on exponential distribution (Poisson Process).
+        Updates self.next_arrival_time.
+        """
+        # Inter-arrival time follows exponential distribution
+        interval = np.random.exponential(self.mean_interval)
+        # The next arrival is relative to the previous scheduled arrival time to maintain average rate,
+        # or relative to current_time if it's the first scheduling or after a reset.
+        # Using max(current_time, ...) ensures we don't schedule in the past.
+        self.next_arrival_time = max(current_time, self.next_arrival_time) + interval
 
 
-class PoissonTaskGenerator:
-    """
-    Generates tasks according to a Poisson process.
-    
-    Inter-arrival times follow exponential distribution with parameter lambda.
-    This generator maintains state for next arrival time calculation.
-    
-    High cohesion: All Poisson generation logic is encapsulated
-    Low coupling: Depends only on numpy and configuration
-    """
-    
-    def __init__(self, lambda_rate: float, random_seed: Optional[int] = None):
-        """
-        Initialize Poisson task generator.
-        
-        Args:
-            lambda_rate: Lambda parameter (tasks per second)
-            random_seed: Random seed for reproducibility
-        """
-        self.lambda_rate = lambda_rate
-        self.mean_inter_arrival = 1.0 / lambda_rate
-        
-        if random_seed is not None:
-            np.random.seed(random_seed)
-        
-        logger.debug(f"Poisson generator initialized: lambda={lambda_rate}, "
-                    f"mean_inter_arrival={self.mean_inter_arrival}s")
-    
-    def get_next_arrival_interval(self) -> float:
-        """
-        Generate next inter-arrival time from exponential distribution.
-        
-        Returns:
-            Inter-arrival time in seconds
-        """
-        interval = np.random.exponential(self.mean_inter_arrival)
-        return interval
-    
-    def get_next_arrival_time(self, current_time: float) -> float:
-        """
-        Calculate the next task arrival time.
-        
-        Args:
-            current_time: Current simulation time
-            
-        Returns:
-            Next arrival time
-        """
-        interval = self.get_next_arrival_interval()
-        return current_time + interval
-
-
-class ITaskManager(ABC):
-    """Abstract interface for task manager implementations"""
-    
-    @abstractmethod
-    def get_task_type(self, task_type_name: str) -> Optional[TaskType]:
-        """Retrieve task type definition"""
-        pass
-    
-    @abstractmethod
-    def generate_next_task(self, current_time: float) -> Tuple['Task', float]:
-        """Generate next task and its arrival time"""
-        pass
-    
-    @abstractmethod
-    def get_all_task_types(self) -> List[TaskType]:
-        """Get all registered task types"""
-        pass
-
-
-class TaskManager(ITaskManager):
+class TaskManager:
     """
     Task Manager Implementation
-    
-    Manages task type definitions, generates tasks according to Poisson process,
-    and tracks task scheduling statistics.
-    
-    High cohesion: Encapsulates all task generation and management logic
-    Low coupling: Depends on TaskType and PoissonTaskGenerator abstractions
+
+    Manages N independent, heterogeneous Poisson task streams.
+    Instead of fixed task types (sampling/computing), it generates diverse streams
+    based on configuration ranges.
     """
-    
-    def __init__(self, 
-                 task_types: List[TaskType],
-                 lambda_arrival_rate: float,
-                 num_nodes: int,
-                 random_seed: Optional[int] = None):
+
+    def __init__(self, config: 'SimulationConfig', random_seed: Optional[int] = None):
         """
-        Initialize task manager.
-        
+        Initialize task manager with random heterogeneous streams.
+
         Args:
-            task_types: List of TaskType definitions
-            lambda_arrival_rate: Poisson process lambda parameter
-            num_nodes: Total number of network nodes
-            random_seed: Random seed for reproducibility
+            config: SimulationConfig object containing STREAM_*_RANGE parameters.
+            random_seed: Seed for reproducibility of stream generation and task arrivals.
         """
-        self.num_nodes = num_nodes
-        self._task_types: Dict[str, TaskType] = {}
+        if random_seed is not None:
+            np.random.seed(random_seed)
+
+        self.config = config
+        self._streams: Dict[str, PoissonTaskStream] = {}
         self._task_id_counter = 0
-        
-        # Validate and store task types
-        for task_type in task_types:
-            task_type.validate(num_nodes)
-            self._task_types[task_type.name] = task_type
-        
-        # Initialize task generator
-        self._generator = PoissonTaskGenerator(lambda_arrival_rate, random_seed)
-        
-        # Statistics
-        self._tasks_generated = 0
-        self._task_type_counts: Dict[str, int] = {name: 0 for name in self._task_types}
-        self._next_arrival_times: Dict[str, float] = {}
-        
-        logger.info(f"TaskManager initialized with {len(task_types)} task types: "
-                   f"{list(self._task_types.keys())}")
-    
-    def get_task_type(self, task_type_name: str) -> Optional[TaskType]:
+
+        # Initialize the random heterogeneous streams
+        self._initialize_random_streams()
+
+    def _initialize_random_streams(self) -> None:
         """
-        Retrieve task type definition by name.
-        
+        Generates fully heterogeneous task streams based on configuration ranges.
+        Each stream simulates a unique device with specific characteristics.
+        """
+        num_streams = getattr(self.config, 'NUM_TASK_STREAMS', 15)
+        logger.info(f"Initializing {num_streams} fully heterogeneous task streams...")
+
+        for i in range(num_streams):
+            stream_id = f"stream_{i:03d}"
+
+            # 1. Randomly generate attributes based on Config ranges
+
+            # Lambda & Interval
+            l_min, l_max = self.config.STREAM_LAMBDA_RANGE
+            lambda_val = np.random.uniform(l_min, l_max)
+            mean_interval = 1.0 / lambda_val
+
+            # Energy Threshold
+            e_min, e_max = self.config.STREAM_ENERGY_RANGE
+            # Round to 2 decimals for realistic voltage values
+            energy_val = round(np.random.uniform(e_min, e_max), 2)
+
+            # Required Nodes
+            n_min, n_max = self.config.STREAM_NODES_RANGE
+            nodes_val = np.random.randint(n_min, n_max + 1)
+
+            # Priority
+            p_min, p_max = self.config.STREAM_PRIORITY_RANGE
+            prio_val = np.random.randint(p_min, p_max + 1)
+
+            # Max Delay (Deadline)
+            # Calculated as a factor of the mean interval (e.g., 1.5x interval)
+            d_min, d_max = self.config.STREAM_DELAY_FACTOR_RANGE
+            delay_factor = np.random.uniform(d_min, d_max)
+            max_delay_val = mean_interval * delay_factor
+
+            # 2. Create the Stream object
+            stream = PoissonTaskStream(
+                stream_id=stream_id,
+                lambda_rate=lambda_val,
+                mean_interval=mean_interval,
+                priority=prio_val,
+                required_nodes=nodes_val,
+                energy_threshold=energy_val,
+                max_delay=max_delay_val
+            )
+
+            # 3. Schedule the first arrival (Random phase start)
+            # Use exponential distribution for the first arrival to stagger start times
+            first_interval = np.random.exponential(mean_interval)
+            stream.next_arrival_time = first_interval
+
+            self._streams[stream_id] = stream
+
+            logger.debug(f"Created {stream_id}: Prio={prio_val}, Nodes={nodes_val}, "
+                         f"Energy={energy_val}V, Lambda={lambda_val:.3f}, Interval={mean_interval:.1f}s")
+
+        logger.info(f"Task Manager ready with {len(self._streams)} streams.")
+
+    def get_next_task_arrival_time(self) -> Tuple[Optional[str], float]:
+        """
+        Find the earliest scheduled arrival time among all streams.
+
+        Returns:
+            Tuple (stream_id, arrival_time).
+            Returns (None, inf) if no streams exist.
+        """
+        if not self._streams:
+            return None, float('inf')
+
+        # Find the stream with the minimum next_arrival_time
+        best_stream = min(self._streams.values(), key=lambda s: s.next_arrival_time)
+        return best_stream.stream_id, best_stream.next_arrival_time
+
+    def generate_next_task(self, current_time: float, stream_id: str) -> Tuple['Task', float]:
+        """
+        Generate a Task instance for the specified stream and schedule its next arrival.
+
         Args:
-            task_type_name: Name of task type
-            
+            current_time: Current simulation time.
+            stream_id: The ID of the stream that is ready to generate a task.
+
         Returns:
-            TaskType object or None if not found
+            Tuple (Task object, next_arrival_time for this stream).
         """
-        return self._task_types.get(task_type_name)
-    
-    def get_all_task_types(self) -> List[TaskType]:
-        """
-        Get all registered task types.
-        
-        Returns:
-            List of TaskType objects
-        """
-        return list(self._task_types.values())
-    
-    def generate_next_task(self, 
-                          current_time: float,
-                          task_type_name: Optional[str] = None) -> Tuple['Task', float]:
-        """
-        Generate the next task.
-        
-        Args:
-            current_time: Current simulation time
-            task_type_name: Specific task type to generate (random if None)
-            
-        Returns:
-            Tuple of (Task object, next arrival time)
-            
-        Raises:
-            ValueError: If task type not found
-        """
-        from .task_queue import Task  # Avoid circular import
-        
-        # Select task type
-        if task_type_name is None:
-            # Random selection from available types
-            task_type_name = np.random.choice(list(self._task_types.keys()))
-        
-        task_type = self.get_task_type(task_type_name)
-        if task_type is None:
-            raise ValueError(f"Unknown task type: {task_type_name}")
-        
-        # Generate task instance
+        # Local import to avoid circular dependency issues at module level
+        from .task_queue import Task
+
+        stream = self._streams.get(stream_id)
+        if not stream:
+            raise ValueError(f"Unknown stream_id: {stream_id}")
+
         self._task_id_counter += 1
-        
-        # Randomly select required nodes within range
-        required_nodes = np.random.randint(
-            task_type.required_nodes_range[0],
-            task_type.required_nodes_range[1] + 1
-        )
-        
+
+        # 1. Instantiate the Task
+        # Note: We use stream.next_arrival_time as the task's official arrival time
+        # to ensure mathematical precision of the Poisson process.
         task = Task(
             task_id=self._task_id_counter,
-            task_type=task_type_name,
-            priority=task_type.priority,
-            arrival_time=current_time,
-            max_delay=task_type.max_delay,
-            required_nodes=required_nodes,
-            energy_threshold=task_type.energy_threshold,
-            enqueue_timestamp=current_time
+            task_type=stream.stream_id,  # Use stream ID as the type identifier
+            priority=stream.priority,
+            arrival_time=stream.next_arrival_time,
+            max_delay=stream.max_delay,
+            required_nodes=stream.required_nodes,
+            energy_threshold=stream.energy_threshold,
+            enqueue_timestamp=current_time  # Record when it actually entered the system
         )
-        
-        # Calculate next arrival time for this task type
-        next_arrival_time = self._generator.get_next_arrival_time(current_time)
-        
-        self._tasks_generated += 1
-        self._task_type_counts[task_type_name] += 1
-        self._next_arrival_times[task_type_name] = next_arrival_time
 
-        logger.info(f"[TASK GEN] ID:{task.task_id:03d} | Type:{task_type_name[:4].upper()} | "
-                    f"Prio:{task.priority} | Nodes:{required_nodes} | "
-                    f"Deadline:{current_time + task.max_delay:.2f}s")
-        
-        return task, next_arrival_time
-    
-    def generate_initial_tasks(self, current_time: float) -> Dict[str, float]:
+        # 2. Schedule the next arrival for this specific stream
+        stream.schedule_next_arrival(stream.next_arrival_time)
+
+        logger.debug(f"[GEN] {stream_id} (#{task.task_id}) generated. "
+                     f"Arr: {task.arrival_time:.2f}s, Next: {stream.next_arrival_time:.2f}s")
+
+        return task, stream.next_arrival_time
+
+    def get_all_task_types(self) -> List[PoissonTaskStream]:
         """
-        Generate initial tasks for all task types and schedule their first arrivals.
-        
+        Returns a list of all stream objects.
+        Used by RL Interface to perceive available 'task types' (streams) and modify them.
+        """
+        return list(self._streams.values())
+
+    def get_task_type(self, stream_id: str) -> Optional[PoissonTaskStream]:
+        """
+        Retrieve a specific stream by ID.
+        """
+        return self._streams.get(stream_id)
+
+    def update_task_type_attribute(self, stream_id: str, attribute: str, value: float) -> None:
+        """
+        Allows RL agent (or other controllers) to dynamically modify stream attributes.
+        LOGS ONLY IF VALUE CHANGES.
+
         Args:
-            current_time: Current simulation time
-            
-        Returns:
-            Dictionary mapping task type to its next arrival time
+            stream_id: The ID of the stream to modify.
+            attribute: The attribute name (e.g., 'priority', 'energy_threshold').
+            value: The new value.
         """
-        next_arrivals = {}
-        
-        for task_type_name in self._task_types.keys():
-            _, next_time = self.generate_next_task(current_time, task_type_name)
-            next_arrivals[task_type_name] = next_time
-        
-        logger.info(f"Initial tasks generated. Next arrivals: {next_arrivals}")
-        
-        return next_arrivals
-    
-    def get_next_task_arrival_time(self) -> Tuple[str, float]:
-        """
-        Get the task type and time of the next scheduled arrival.
-        
-        Returns:
-            Tuple of (task_type_name, arrival_time)
-        """
-        if not self._next_arrival_times:
-            return None, float('inf')
-        
-        task_type = min(self._next_arrival_times, 
-                       key=self._next_arrival_times.get)
-        arrival_time = self._next_arrival_times[task_type]
-        
-        return task_type, arrival_time
-    
-    def update_task_arrival(self, task_type_name: str, current_time: float) -> None:
-        """
-        Update the next arrival time for a task type after generation.
-        
-        Args:
-            task_type_name: Task type that was just generated
-            current_time: Current simulation time
-        """
-        next_time = self._generator.get_next_arrival_time(current_time)
-        self._next_arrival_times[task_type_name] = next_time
-    
+        stream = self._streams.get(stream_id)
+        if stream and hasattr(stream, attribute):
+            old_val = getattr(stream, attribute)
+
+            # [修改] 仅当值真正发生变化时才更新和打印日志
+            # 对于浮点数，!= 判断通常足够，因为 RL Agent 即使输出 3.800000001 也是一种变化
+            # 对于整数优先级，这能完美过滤 1 -> 1 的情况
+            if old_val != value:
+                setattr(stream, attribute, value)
+                logger.info(f"Updated {stream_id}.{attribute}: {old_val} -> {value}")
+        else:
+            logger.warning(f"Failed to update {stream_id}: attribute '{attribute}' not found or stream unknown.")
+
+    def generate_initial_tasks(self, current_time: float) -> None:
+        """Legacy method for compatibility."""
+        pass
+
     def get_statistics(self) -> Dict:
-        """
-        Get task generation statistics.
-        
-        Returns:
-            Dictionary containing task statistics
-        """
+        """Get task generation statistics."""
         return {
-            'total_generated': self._tasks_generated,
-            'type_counts': self._task_type_counts,
-            'next_arrivals': self._next_arrival_times,
-            'num_task_types': len(self._task_types),
+            'total_generated': self._task_id_counter,
+            'num_streams': len(self._streams),
+            'next_arrival': self.get_next_task_arrival_time()[1]
         }
-    
-    def update_task_type_attribute(self,
-                                   task_type_name: str,
-                                   attribute: str,
-                                   value: float) -> None:
-        """
-        Update a task type attribute (called by RL interface).
-        
-        This method allows RL agent to dynamically modify task attributes
-        such as priority, energy threshold, and required node count.
-        
-        Args:
-            task_type_name: Task type to update
-            attribute: Attribute name ('priority', 'energy_threshold', etc.)
-            value: New value
-            
-        Raises:
-            ValueError: If task type or attribute not found
-        """
-        task_type = self.get_task_type(task_type_name)
-        if task_type is None:
-            raise ValueError(f"Unknown task type: {task_type_name}")
-        
-        if not hasattr(task_type, attribute):
-            raise ValueError(f"Task type {task_type_name} has no attribute {attribute}")
-        
-        old_value = getattr(task_type, attribute)
-        setattr(task_type, attribute, value)
-        
-        logger.info(f"Updated {task_type_name}.{attribute}: {old_value} -> {value}")

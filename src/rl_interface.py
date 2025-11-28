@@ -30,73 +30,65 @@ class ActionType(Enum):
 
 class RLAction:
     """
-    Represents an action taken by RL agent.
-    
-    The action space is 4-dimensional:
-    - sampling_period: float - new sampling period for data collection
-    - task_priority: int - priority level to adjust
-    - energy_threshold: float - new energy threshold
-    - required_nodes: int - number of nodes required
+    Action space:
+    - sampling_period: float
+    - energy_threshold: List[float] (针对每个流)
+    - task_priority: List[int] (针对每个流) [新增]
     """
-    
+
     def __init__(self,
                  sampling_period: float = None,
-                 task_priority: int = None,
-                 energy_threshold: List[float] = None,  # 修改为列表
-                 required_nodes: int = None):
+                 energy_threshold: List[float] = None,
+                 task_priority: List[int] = None):  # 修改类型为列表
         self.sampling_period = sampling_period
-        self.task_priority = task_priority
         self.energy_threshold = energy_threshold
-        self.required_nodes = required_nodes
-        self.required_nodes = required_nodes
+        self.task_priority = task_priority
 
     def to_vector(self) -> np.ndarray:
-        """Convert action to vector form for RL agent"""
-        # [修改] 1. 处理 energy_threshold 是列表的情况
-        if isinstance(self.energy_threshold, list):
-            eth_values = self.energy_threshold
-        elif isinstance(self.energy_threshold, (float, int)):
-            eth_values = [float(self.energy_threshold)]
-        else:
-            eth_values = [0.0]
+        """Flatten all components into a single vector"""
+        # 1. Sampling Period
+        components = [self.sampling_period or 0.0]
 
-        # [修改] 2. 构建扁平化的列表 (Flat List)
-        # 顺序: [sampling_period, task_priority, eth_1, eth_2, ..., eth_N, required_nodes]
-        # 注意：这里我们把阈值列表展平塞进去
-        components = [
-            self.sampling_period or 0.0,
-            float(self.task_priority or 0)
-        ]
-        components.extend(eth_values)  # 关键：使用 extend 而不是 append
-        components.append(self.required_nodes or 0.0)
+        # 2. Energy Thresholds
+        if isinstance(self.energy_threshold, list):
+            components.extend(self.energy_threshold)
+        else:
+            # 兼容旧代码或空值
+            components.append(0.0)
+
+            # 3. Task Priorities [新增]
+        if isinstance(self.task_priority, list):
+            components.extend([float(p) for p in self.task_priority])
+        else:
+            components.append(0.0)
 
         return np.array(components, dtype=np.float32)
 
     @classmethod
-    def from_vector(cls, action_vector: np.ndarray) -> 'RLAction':
-        """Construct action from vector output by RL agent"""
-        # 注意：如果向量长度变了，这里解析逻辑也需要变。
-        # 在多阈值情况下，解析会比较麻烦，需要知道阈值的数量。
-        # 简单起见，这里假设阈值只有一个或者是定长的，或者直接取剩余部分。
-        # 既然是离线数据收集，如果不回放数据进行训练，可以暂时简化处理或略过此方法。
-
-        # 假设 action_vector = [period, prio, eth_1...eth_N, nodes]
+    def from_vector(cls, action_vector: np.ndarray, num_streams: int = 15) -> 'RLAction':
+        """
+        解析向量。需要知道流的数量来正确切分。
+        Vector Structure: [Period(1), Energy(N), Priority(N)]
+        """
         sampling_period = float(action_vector[0])
-        task_priority = int(action_vector[1])
-        required_nodes = int(action_vector[-1])  # 最后一个是 nodes
 
-        # 中间部分全是阈值
-        energy_thresholds = action_vector[2:-1].tolist()
+        # 切片
+        # Energy: index 1 到 1+N
+        eth_start = 1
+        eth_end = 1 + num_streams
+        energy_thresholds = action_vector[eth_start:eth_end].tolist()
 
-        # 如果只有一个阈值，转回 float (为了兼容旧代码)
-        if len(energy_thresholds) == 1:
-            energy_thresholds = energy_thresholds[0]
+        # Priority: index 1+N 到 1+2N
+        prio_start = eth_end
+        prio_end = 1 + 2 * num_streams
+        # 即使向量后面还有数据（如 required_nodes），我们只读我们需要的部分
+        # 如果向量长度不足，这里会报错，需确保 config.RL_ACTION_DIM 正确
+        priorities = [int(p) for p in action_vector[prio_start:prio_end]]
 
         return cls(
             sampling_period=sampling_period,
-            task_priority=task_priority,
             energy_threshold=energy_thresholds,
-            required_nodes=required_nodes
+            task_priority=priorities
         )
 
 
@@ -326,55 +318,36 @@ class RLInterface:
                      task_manager: 'TaskManager',
                      simulink_interface: 'SimulinkInterface',
                      task_queue: 'TaskQueue') -> None:
-        """
-        Apply RL action to system components.
-        
-        Args:
-            action: RLAction to apply
-            task_manager: TaskManager instance to update
-            simulink_interface: SimulinkInterface to update
-        """
+
+        # 1. 应用采样周期
         if action.sampling_period is not None and action.sampling_period > 0:
-            try:
-                simulink_interface.set_sampling_period(action.sampling_period)
-            except Exception as e:
-                logger.error(f"Error applying sampling period action: {e}")
-        
-        if action.task_priority is not None and action.task_priority > 0:
-            # TODO: Implement task priority adjustment
-            logger.debug(f"Task priority adjustment not yet implemented")
+            simulink_interface.set_sampling_period(action.sampling_period)
 
+        # 获取所有流对象
+        current_streams = task_manager.get_all_task_types()
+
+        # 2. 应用能量阈值 (批量)
         if action.energy_threshold is not None:
-            current_task_types = task_manager.get_all_task_types()
-
-            # 校验维度是否匹配
-            if len(action.energy_threshold) == len(current_task_types):
-                for i, task_type in enumerate(current_task_types):
-                    new_threshold = action.energy_threshold[i]
-                    try:
-                        # 核心修改：针对特定任务名更新属性
-                        task_manager.update_task_type_attribute(
-                            task_type.name,
-                            "energy_threshold",
-                            new_threshold
-                        )
-                        logger.debug(f"Updated {task_type.name} threshold -> {new_threshold:.2f}V")
-                    except ValueError as e:
-                        logger.warning(f"Failed to update {task_type.name}: {e}")
+            if len(action.energy_threshold) == len(current_streams):
+                for i, stream in enumerate(current_streams):
+                    # 调用 TaskManager 的 update 接口
+                    task_manager.update_task_type_attribute(
+                        stream.stream_id, "energy_threshold", action.energy_threshold[i]
+                    )
             else:
-                logger.error(f"Action threshold dim ({len(action.energy_threshold)}) "
-                             f"mismatch with task types ({len(current_task_types)})")
-        
-        if action.required_nodes is not None and action.required_nodes > 0:
-            # TODO: Implement required nodes adjustment
-            logger.debug(f"Required nodes adjustment not yet implemented")
+                logger.error(f"Action energy dim ({len(action.energy_threshold)}) != Streams ({len(current_streams)})")
 
-        scheduling_mode = action.task_priority
-
-        if scheduling_mode == 1:
-            self._apply_priority_inversion(task_queue)
-        elif scheduling_mode == 2:
-            self._apply_queue_shuffle(task_queue)
+        # 3. [新增] 应用优先级 (批量)
+        if action.task_priority is not None:
+            if len(action.task_priority) == len(current_streams):
+                for i, stream in enumerate(current_streams):
+                    # 确保优先级在 1-3 之间
+                    new_prio = max(1, min(3, int(action.task_priority[i])))
+                    task_manager.update_task_type_attribute(
+                        stream.stream_id, "priority", new_prio
+                    )
+            else:
+                logger.error(f"Action priority dim ({len(action.task_priority)}) != Streams ({len(current_streams)})")
 
     def _apply_priority_inversion(self, task_queue):
         """

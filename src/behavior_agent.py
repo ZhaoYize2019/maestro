@@ -12,62 +12,79 @@ class BehaviorAgent(IRLAgent):
     Mix of Frugal Strategy (80%) and Random Exploration (20%).
     """
 
-    def __init__(self, action_space_limits: dict, task_types: list):
+    def __init__(self, action_space_limits: dict, task_streams: list):
         self.limits = action_space_limits
-        self.task_types = task_types  # 记录任务类型，例如 ['sampling', 'computing', 'communication']
+        self.task_streams = task_streams  # 这是一个 PoissonTaskStream 对象列表
         self.exploration_rate = 0.2
-        self.task_queue = None  # 新增：用于持有队列引用
+        self.task_queue = None
+
+        # [新增] 用于感知紧急程度
+        self.current_time = 0.0
 
     def bind_task_queue(self, task_queue):
-        """注入 TaskQueue 实例"""
         self.task_queue = task_queue
 
+    def set_current_time(self, time_val: float):
+        """由 Simulator 每步调用，更新 Agent 的时间感知"""
+        self.current_time = time_val
+
     def get_action(self, state: np.ndarray) -> RLAction:
-        # 1. 感知：检查队列状态
-        queue_pressure = 0.0
-        if self.task_queue:
-            # 例如：计算排队任务的总等待时间作为“压力值”
-            # 注意：这里需要访问 TaskQueue 的内部或提供新接口
-            # 假设我们只看长度：
-            queue_pressure = self.task_queue.get_total_length()
-
-        # 2. 决策：基于压力值调整策略
-        # 如果队列压力大，以一定概率尝试“激进调度”（例如反转优先级）来探索极限
-        force_exploration = False
-        if queue_pressure > 10 and random.random() < 0.3:
-            logger.info(f"High Queue Pressure ({queue_pressure})! Triggering Aggressive Scheduling.")
-            force_exploration = True
-
-        if force_exploration or random.random() < self.exploration_rate:
-            return self._get_random_action(force_reorder=force_exploration)
+        # 1. 决定模式
+        # 如果队列压力大，或者随机骰子，进入探索模式
+        # 这里为了演示用户需求：通常模式 vs 随机模式
+        if random.random() < self.exploration_rate:
+            return self._get_random_exploration_action()
         else:
-            return self._get_frugal_action()
+            return self._get_smart_priority_action()
 
-    def _get_random_action(self, force_reorder=False) -> RLAction:
-        random_thresholds = [
-            random.uniform(*self.limits['energy_threshold'])
-            for _ in self.task_types
-        ]
-        # 新增：调度模式 (0: 默认FIFO, 1: 优先级反转/随机洗牌)
-        scheduling_mode = 1 if force_reorder else 0
+    def _get_random_exploration_action(self) -> RLAction:
+        """随机探索模式：所有参数随机"""
+        num_streams = len(self.task_streams)
+
+        # 随机生成 N 个阈值
+        rand_energy = [random.uniform(*self.limits['energy_threshold']) for _ in range(num_streams)]
+        # 随机生成 N 个优先级
+        rand_prio = [random.choice(self.limits['priority_levels']) for _ in range(num_streams)]
 
         return RLAction(
             sampling_period=random.uniform(*self.limits['sampling_period']),
-            energy_threshold=random_thresholds,  # 传入列表
-            required_nodes=random.randint(*self.limits['required_nodes']),
-            task_priority=scheduling_mode  # 复用 task_priority 字段，或新增字段
+            energy_threshold=rand_energy,
+            task_priority=rand_prio
         )
 
-    def _get_frugal_action(self) -> RLAction:
-        # [修改] 节俭模式下，所有任务都使用最大阈值（或者您可以定义某类任务更保守）
-        max_energy = self.limits['energy_threshold'][1]
-        frugal_thresholds = [max_energy for _ in self.task_types]
+    def _get_smart_priority_action(self) -> RLAction:
+        num_streams = len(self.task_streams)
+
+        # [调整 1] 默认能量阈值不要设为最大 (3.8)，设为中位数或稍高 (例如 3.0)
+        # 这样非紧急任务也有机会执行，而不是必须等到满电
+        default_energy = 3.0
+        default_prio = 1
+
+        priorities = [default_prio] * num_streams
+        energies = [default_energy] * num_streams
+
+        if self.task_queue:
+            id_to_idx = {stream.stream_id: i for i, stream in enumerate(self.task_streams)}
+
+            for q in self.task_queue._queues.values():
+                for task in q:
+                    wait_time = self.current_time - task.arrival_time
+                    wait_ratio = wait_time / task.max_delay
+
+                    # 如果等待时间超过 70%
+                    if wait_ratio > 0.7:
+                        stream_id = task.task_type
+                        if stream_id in id_to_idx:
+                            idx = id_to_idx[stream_id]
+
+                            # [调整 2] 紧急状态下：提权 + 降阈值
+                            priorities[idx] = 3  # 提高优先级
+                            energies[idx] = 1.8  # 降低门槛到最小值，确保能立刻执行！
 
         return RLAction(
             sampling_period=self.limits['sampling_period'][1],
-            energy_threshold=frugal_thresholds, # 传入列表
-            required_nodes=self.limits['required_nodes'][0],
-            task_priority=max(self.limits['priority_levels'])
+            energy_threshold=energies,
+            task_priority=priorities
         )
 
     def update(self, state, action, reward, next_state, done):

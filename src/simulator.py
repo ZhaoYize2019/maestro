@@ -8,15 +8,15 @@ import time
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
-
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')  # <--- 关键行：必须放在 pyplot 之前！
+matplotlib.use('Agg')  # 关键行：必须放在 pyplot 之前！
 import matplotlib.pyplot as plt
 
 from .config import SimulationConfig
 from .task_queue import TaskQueue, Task
-from .task_manager import TaskManager, TaskType, PoissonTaskGenerator
+# [修改] 移除了 TaskType 的导入，因为该类已在 TaskManager 重构中废弃
+from .task_manager import TaskManager
 from .state_calculator import StateCalculator
 from .simulink_interface import SimulinkInterface
 from .rl_interface import RLInterface, RLAction, RLReward
@@ -41,20 +41,15 @@ class SimulationMetrics:
 class MaestroSimulator:
     """
     Main Maestro Simulator Orchestrator
-    
+
     Coordinates simulation of all modules and executes the complete
     S-A-R-S' (State-Action-Reward-State) reinforcement learning loop.
-    
-    Architecture:
-    1. Initialization phase: Set up all components
-    2. Main simulation loop: Execute periodic samples and task processing
-    3. Cleanup phase: Save results and close connections
     """
-    
+
     def __init__(self, config: SimulationConfig, rl_enabled: bool = False, agent: Optional[IRLAgent] = None):
         """
         Initialize Maestro simulator.
-        
+
         Args:
             config: SimulationConfig object with all parameters
             rl_enabled: Enable RL agent integration
@@ -62,57 +57,35 @@ class MaestroSimulator:
         SimulationConfig.validate(config)
         self.config = config
 
+        num_streams = config.NUM_TASK_STREAMS
+        config.RL_ACTION_DIM = 1 + num_streams + num_streams
+
         self.rl_interface = RLInterface(
             state_dimension=config.STATE_DIMENSION,
             action_dimension=config.RL_ACTION_DIM,
             rl_agent=agent,
             enabled=rl_enabled
         )
-        
+
         # Initialize core components
         self.task_queue = TaskQueue(
             config.NUM_PRIORITY_LEVELS,
             config.PRIORITY_LEVELS
         )
-        
-        # Define task types
-        task_types = [
-            TaskType(
-                name="sampling",
-                priority=1,
-                max_delay=30.0,
-                required_nodes_range=(1, 5),
-                energy_threshold=2.0
-            ),
-            TaskType(
-                name="computing",
-                priority=2,
-                max_delay=60.0,
-                required_nodes_range=(3, 10),
-                energy_threshold=2.5
-            ),
-            TaskType(
-                name="communication",
-                priority=3,
-                max_delay=20.0,
-                required_nodes_range=(2, 8),
-                energy_threshold=1.8
-            ),
-        ]
-        
+
+        # [修改] 不再手动定义 task_types 列表
+        # 现在的 TaskManager 会根据 config 中的范围参数自动生成随机异构任务流
         self.task_manager = TaskManager(
-            task_types=task_types,
-            lambda_arrival_rate=config.LAMBDA_ARRIVAL_RATE,
-            num_nodes=config.NUM_NODES,
+            config=config,
             random_seed=42
         )
-        
+
         self.state_calculator = StateCalculator(
             num_nodes=config.NUM_NODES,
             state_dimension=config.STATE_DIMENSION,
             voltage_max=config.VOLTAGE_MAX
         )
-        
+
         self.simulink_interface = SimulinkInterface(
             sampling_period=config.SAMPLING_PERIOD,
             num_nodes=config.NUM_NODES,
@@ -126,7 +99,7 @@ class MaestroSimulator:
 
         self.voltage_history: List[List[float]] = []
         self.time_history: List[float] = []
-        
+
         # Simulation state
         self.current_time = 0.0
         self.metrics = SimulationMetrics()
@@ -134,65 +107,65 @@ class MaestroSimulator:
 
         self.node_release_times = [0.0] * config.NUM_NODES
         logger.info("Node locking mechanism initialized.")
-        
+
         logger.info(f"MaestroSimulator initialized with config: {config}")
-    
+
     def initialize(self) -> None:
         """Initialize simulation and start Simulink interface"""
         logger.info("=" * 60)
         logger.info("Initializing Maestro Simulator")
         logger.info("=" * 60)
-        
+
         # Start Simulink
         self.simulink_interface.initialize()
-        
+
         # Generate first batch of tasks
+        # TaskManager 已经在 init 中预排了时间，这里调用一下是安全的（虽然在泊松模式下可能不做实际操作）
         self.task_manager.generate_initial_tasks(self.current_time)
-        
+
         # Initialize energy data
         initial_voltages, _ = self.simulink_interface.get_node_energies()
         self.state_calculator.update_energy_data(initial_voltages, self.current_time)
 
         logger.info("Simulator initialization complete")
-    
+
     def _get_next_event_time(self) -> float:
         """Determine the next event time (task arrival or sample time)"""
         # Next scheduled sampling time
-        # 从接口获取当前实际的采样周期
         current_period = self.simulink_interface.sampling_period
         next_sample_time = self.current_time + current_period
-        
+
         # Next task arrival time
-        next_task_type, next_task_time = self.task_manager.get_next_task_arrival_time()
-        
+        # [修改] 变量名适配: stream_id
+        stream_id, next_task_time = self.task_manager.get_next_task_arrival_time()
+
         # Return minimum of both
         return min(next_sample_time, next_task_time)
-    
+
     def _check_and_create_tasks(self) -> int:
         """Check for scheduled task arrivals and create them"""
         tasks_created = 0
-        
+
         while True:
-            next_task_type, next_task_time = self.task_manager.get_next_task_arrival_time()
-            
+            stream_id, next_task_time = self.task_manager.get_next_task_arrival_time()
+
             if next_task_time > self.current_time:
                 break
-            
+
             # Generate the task
+            # [修改] 现在的 TaskManager 在生成任务时会自动调度下一次到达
+            # 所以不需要手动调用 update_task_arrival
             task, arrival_time = self.task_manager.generate_next_task(
                 self.current_time,
-                next_task_type
+                stream_id
             )
-            
+
             # Enqueue task
             self.task_queue.enqueue(task)
-            
-            # Update next arrival time
-            self.task_manager.update_task_arrival(next_task_type, self.current_time)
-            
+
             tasks_created += 1
             logger.debug(f"Task {task.task_id} arrived at {self.current_time}s")
-        
+
         return tasks_created
 
     def _process_tasks(self) -> Tuple[int, int]:
@@ -217,9 +190,7 @@ class MaestroSimulator:
             if task is None:
                 break
 
-            # [关键修改] 找出所有“可用”节点
-            # 条件 A: 能量 > 阈值
-            # 条件 B: 当前时间 >= 节点的释放时间 (即节点是空闲的)
+            # 找出所有“可用”节点
             candidate_nodes = []
             busy_nodes_count = 0
 
@@ -234,7 +205,6 @@ class MaestroSimulator:
 
             available_count = len(candidate_nodes)
 
-            # 决策日志头部
             decision_msg = (f"[CHECK] Task {task.task_id:03d} (Prio {task.priority}) | "
                             f"Need {task.required_nodes} nodes | "
                             f"Candidates: {available_count} (Busy: {busy_nodes_count})")
@@ -243,11 +213,9 @@ class MaestroSimulator:
                 # --- 资源充足，执行任务 ---
                 task = self.task_queue.dequeue()
 
-                # 贪婪策略：选择前 N 个可用的候选节点
                 selected_nodes = candidate_nodes[:task.required_nodes]
 
-                # [关键修改] 锁定节点状态
-                # 假设每个任务占用 1 个采样周期 (如果任务有 duration 属性，这里改为 task.duration)
+                # 锁定节点状态
                 task_duration = self.config.SAMPLING_PERIOD
                 release_time = self.current_time + task_duration
 
@@ -263,16 +231,15 @@ class MaestroSimulator:
                 logger.info(f"{decision_msg} -> EXECUTE on {selected_nodes} (Locked until {release_time:.1f}s)")
             else:
                 # --- 资源不足 ---
-                # 区分是因为没电，还是因为都在忙
                 if busy_nodes_count > 0 and (available_count + busy_nodes_count >= task.required_nodes):
                     logger.info(f"{decision_msg} -> BLOCKED (Nodes Busy)")
                 else:
                     logger.info(f"{decision_msg} -> BLOCKED (Insufficient Energy)")
 
-                # 发生阻塞，跳出循环（等待下一时刻状态变化）
+                # 发生阻塞，跳出循环
                 break
 
-        # --- 超时检查循环 (保持不变) ---
+        # --- 超时检查循环 ---
         while True:
             peeked_task = self.task_queue.peek()
             if peeked_task is None:
@@ -291,7 +258,7 @@ class MaestroSimulator:
                 break
 
         return tasks_executed, tasks_failed
-    
+
     def _simulation_step(self) -> None:
         """Execute one simulation step"""
         # Update simulation time
@@ -305,7 +272,7 @@ class MaestroSimulator:
             self.time_history.append(self.current_time)
             self.voltage_history.append(current_energies)
 
-            # 统计电压分布：<1.8V (低电), 1.8-2.5V (中), >2.5V (高)
+            # 统计电压分布
             low = sum(1 for v in current_energies if v < 1.8)
             mid = sum(1 for v in current_energies if 1.8 <= v < 2.5)
             high = sum(1 for v in current_energies if v >= 2.5)
@@ -322,27 +289,22 @@ class MaestroSimulator:
         # Update current time
         self.current_time = self.simulink_interface.get_current_time()
 
-        if current_energies:
-            # 将每个电压格式化为保留2位小数的字符串
-            volts_str = ", ".join([f"{v:.2f}" for v in current_energies])
+        if self.rl_interface.enabled and hasattr(self.rl_interface.rl_agent, "set_current_time"):
+            self.rl_interface.rl_agent.set_current_time(self.current_time)
 
-            # 打印完整数组
+        if current_energies:
+            volts_str = ", ".join([f"{v:.2f}" for v in current_energies])
             logger.info(f"Step [{self.current_time:.1f}s] Energy States:")
             logger.info(f"  -> Voltages: [{volts_str}]")
-
-            # (可选) 如果您还想看输入的电流情况，也可以同样打印
-            # inputs_str = ", ".join([f"{i:.4f}" for i in debug_inputs])
-            # logger.info(f"  -> Inputs:   [{inputs_str}]")
         else:
             logger.warning("Step data is empty!")
 
-            # 确保同时也更新状态计算器的数据
         self.state_calculator.update_energy_data(current_energies, self.current_time)
-        
+
         # Check for new task arrivals
         self._check_and_create_tasks()
 
-        # Compute current state (use simulation time for wait calculations)
+        # Compute current state
         queue_length = self.task_queue.get_total_length()
         queue_priority = self.task_queue.get_highest_priority()
         max_wait_time = self.task_queue.get_max_waiting_time(current_time=self.current_time)
@@ -384,8 +346,8 @@ class MaestroSimulator:
         # Compute reward
         reward = self.rl_interface.compute_reward(
             tasks_completed=tasks_executed,
-            energy_used=0.0,  # TODO: Calculate actual energy used
-            avg_response_time=0.0,  # TODO: Calculate average response time
+            energy_used=0.0,
+            avg_response_time=0.0,
             deadlines_missed=self.metrics.deadlines_missed,
             time_step=self.config.SAMPLING_PERIOD
         )
@@ -410,30 +372,29 @@ class MaestroSimulator:
             f"Step {len(self._trajectory_data)}: time={self.current_time:.1f}s, "
             f"reward={reward.total:.3f}, queue_len={queue_length}"
         )
-    
+
     def run(self) -> None:
         """Run complete simulation"""
         logger.info("=" * 60)
         logger.info("Starting Maestro Simulation")
         logger.info(f"Duration: {self.config.SIMULATION_DURATION}s")
         logger.info("=" * 60)
-        
+
         self.initialize()
         start_wall_time = time.time()
-        
+
         try:
             step_count = 0
             while self.current_time < self.config.SIMULATION_DURATION:
                 self._simulation_step()
                 step_count += 1
-                
-                # Progress logging every 100 steps
+
                 if step_count % 100 == 0:
                     elapsed = time.time() - start_wall_time
                     progress = self.current_time / self.config.SIMULATION_DURATION * 100
                     logger.info(f"Progress: {progress:.1f}% (sim_time={self.current_time:.1f}s, "
                                f"wall_time={elapsed:.1f}s, tasks={self.metrics.tasks_completed})")
-        
+
         except KeyboardInterrupt:
             logger.warning("Simulation interrupted by user")
         except Exception as e:
@@ -447,20 +408,16 @@ class MaestroSimulator:
         logger.info("Finalizing Simulation")
         logger.info("=" * 60)
 
-        # [修改] 1. 先获取数据 (必须在 stop 之前或者 stop 之后但引擎关闭之前)
-        # 注意：stop() 只是停止仿真，不会清空工作区，所以顺序没关系，只要引擎还在
         self.simulink_interface.stop()
 
         full_times, full_voltages = self.simulink_interface.get_full_history()
 
-        # [修改] 2. 绘图 (传入全量数据)
         if len(full_times) > 0:
             self._plot_voltage_curves(full_times, full_voltages)
         else:
             logger.warning("No full history data found. Using coarse Python logs.")
-            # 降级方案：如果没有配置 To Workspace，仍使用 Python 记录的数据
             self._plot_voltage_curves(np.array(self.time_history), np.array(self.voltage_history))
-        
+
         # Log final metrics
         self.metrics.current_time = self.current_time
         logger.info(f"Simulation complete")
@@ -468,7 +425,7 @@ class MaestroSimulator:
         logger.info(f"  Tasks failed: {self.metrics.tasks_failed}")
         logger.info(f"  Deadlines missed: {self.metrics.deadlines_missed}")
         logger.info(f"  Total steps: {len(self._trajectory_data)}")
-        
+
         # Save trajectory if enabled
         if self.config.SAVE_TRAJECTORY:
             self._save_trajectory()
@@ -480,11 +437,8 @@ class MaestroSimulator:
             return
 
         try:
-            # 确保使用 Agg 后端 (之前步骤已设置)
             plt.figure(figsize=(12, 6))
 
-            # 绘制所有节点的电压曲线
-            # data 应该是 (Time, Nodes)
             nodes_count = data.shape[1] if len(data.shape) > 1 else 1
 
             for node_id in range(nodes_count):
@@ -498,6 +452,7 @@ class MaestroSimulator:
             plt.axhline(y=self.config.ENERGY_THRESHOLD_MAX, color='g', linestyle='--', label='Max Threshold')
 
             plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+            # Legend might be too big if many nodes, can adjust
             plt.legend(loc='upper right', bbox_to_anchor=(1.1, 1), ncol=1, fontsize='small')
             plt.tight_layout()
 
@@ -506,7 +461,6 @@ class MaestroSimulator:
             plt.close()
 
             logger.info(f"High-res plot saved to: {output_file}")
-            print(f"Full trajectory plot saved to '{output_file}'")
 
         except Exception as e:
             logger.error(f"Failed to plot results: {e}")
@@ -514,7 +468,7 @@ class MaestroSimulator:
     def _save_trajectory(self) -> None:
         """Save trajectory data for analysis"""
         import pickle
-        
+
         try:
             with open(self.config.TRAJECTORY_FILE, 'wb') as f:
                 pickle.dump({
