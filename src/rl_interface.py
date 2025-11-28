@@ -42,42 +42,61 @@ class RLAction:
     def __init__(self,
                  sampling_period: float = None,
                  task_priority: int = None,
-                 energy_threshold: float = None,
+                 energy_threshold: List[float] = None,  # 修改为列表
                  required_nodes: int = None):
-        """
-        Initialize RL action.
-        
-        Args:
-            sampling_period: New sampling period (seconds)
-            task_priority: Task priority level to modify
-            energy_threshold: New energy threshold (Volts)
-            required_nodes: New required node count
-        """
         self.sampling_period = sampling_period
         self.task_priority = task_priority
         self.energy_threshold = energy_threshold
         self.required_nodes = required_nodes
-    
+        self.required_nodes = required_nodes
+
     def to_vector(self) -> np.ndarray:
         """Convert action to vector form for RL agent"""
-        return np.array([
+        # [修改] 1. 处理 energy_threshold 是列表的情况
+        if isinstance(self.energy_threshold, list):
+            eth_values = self.energy_threshold
+        elif isinstance(self.energy_threshold, (float, int)):
+            eth_values = [float(self.energy_threshold)]
+        else:
+            eth_values = [0.0]
+
+        # [修改] 2. 构建扁平化的列表 (Flat List)
+        # 顺序: [sampling_period, task_priority, eth_1, eth_2, ..., eth_N, required_nodes]
+        # 注意：这里我们把阈值列表展平塞进去
+        components = [
             self.sampling_period or 0.0,
-            self.task_priority or 0,
-            self.energy_threshold or 0.0,
-            self.required_nodes or 0
-        ], dtype=np.float32)
-    
+            float(self.task_priority or 0)
+        ]
+        components.extend(eth_values)  # 关键：使用 extend 而不是 append
+        components.append(self.required_nodes or 0.0)
+
+        return np.array(components, dtype=np.float32)
+
     @classmethod
     def from_vector(cls, action_vector: np.ndarray) -> 'RLAction':
         """Construct action from vector output by RL agent"""
-        if len(action_vector) != 4:
-            raise ValueError(f"Expected 4-dim action, got {len(action_vector)}")
-        
+        # 注意：如果向量长度变了，这里解析逻辑也需要变。
+        # 在多阈值情况下，解析会比较麻烦，需要知道阈值的数量。
+        # 简单起见，这里假设阈值只有一个或者是定长的，或者直接取剩余部分。
+        # 既然是离线数据收集，如果不回放数据进行训练，可以暂时简化处理或略过此方法。
+
+        # 假设 action_vector = [period, prio, eth_1...eth_N, nodes]
+        sampling_period = float(action_vector[0])
+        task_priority = int(action_vector[1])
+        required_nodes = int(action_vector[-1])  # 最后一个是 nodes
+
+        # 中间部分全是阈值
+        energy_thresholds = action_vector[2:-1].tolist()
+
+        # 如果只有一个阈值，转回 float (为了兼容旧代码)
+        if len(energy_thresholds) == 1:
+            energy_thresholds = energy_thresholds[0]
+
         return cls(
-            sampling_period=float(action_vector[0]),
-            task_priority=int(action_vector[1]),
-            energy_threshold=float(action_vector[2]),
-            required_nodes=int(action_vector[3])
+            sampling_period=sampling_period,
+            task_priority=task_priority,
+            energy_threshold=energy_thresholds,
+            required_nodes=required_nodes
         )
 
 
@@ -135,7 +154,7 @@ class IRLAgent(ABC):
     def get_action(self, state: np.ndarray) -> RLAction:
         """Select action based on current state"""
         pass
-    
+
     @abstractmethod
     def update(self, 
                state: np.ndarray,
@@ -301,11 +320,12 @@ class RLInterface:
         
         except Exception as e:
             logger.error(f"Error updating RL agent: {e}")
-    
+
     def apply_action(self,
                      action: RLAction,
                      task_manager: 'TaskManager',
-                     simulink_interface: 'SimulinkInterface') -> None:
+                     simulink_interface: 'SimulinkInterface',
+                     task_queue: 'TaskQueue') -> None:
         """
         Apply RL action to system components.
         
@@ -323,15 +343,64 @@ class RLInterface:
         if action.task_priority is not None and action.task_priority > 0:
             # TODO: Implement task priority adjustment
             logger.debug(f"Task priority adjustment not yet implemented")
-        
+
         if action.energy_threshold is not None:
-            # TODO: Implement energy threshold adjustment
-            logger.debug(f"Energy threshold adjustment not yet implemented")
+            current_task_types = task_manager.get_all_task_types()
+
+            # 校验维度是否匹配
+            if len(action.energy_threshold) == len(current_task_types):
+                for i, task_type in enumerate(current_task_types):
+                    new_threshold = action.energy_threshold[i]
+                    try:
+                        # 核心修改：针对特定任务名更新属性
+                        task_manager.update_task_type_attribute(
+                            task_type.name,
+                            "energy_threshold",
+                            new_threshold
+                        )
+                        logger.debug(f"Updated {task_type.name} threshold -> {new_threshold:.2f}V")
+                    except ValueError as e:
+                        logger.warning(f"Failed to update {task_type.name}: {e}")
+            else:
+                logger.error(f"Action threshold dim ({len(action.energy_threshold)}) "
+                             f"mismatch with task types ({len(current_task_types)})")
         
         if action.required_nodes is not None and action.required_nodes > 0:
             # TODO: Implement required nodes adjustment
             logger.debug(f"Required nodes adjustment not yet implemented")
-    
+
+        scheduling_mode = action.task_priority
+
+        if scheduling_mode == 1:
+            self._apply_priority_inversion(task_queue)
+        elif scheduling_mode == 2:
+            self._apply_queue_shuffle(task_queue)
+
+    def _apply_priority_inversion(self, task_queue):
+        """
+        策略示例：将低优先级队列的任务临时提升，模拟 '饿死' 高优先级任务的场景
+        这有助于收集极端情况下的数据 (Corner Cases)
+        """
+        # 注意：这需要访问 TaskQueue 的私有属性 _queues，或者在 TaskQueue 中增加相应公共方法
+        # 这里演示直接操作逻辑（Python 允许访问 _queues，虽然不推荐）
+        if hasattr(task_queue, '_queues'):
+            # 简单粗暴：交换 高(3) 和 低(1) 优先级的整个队列
+            q1 = task_queue._queues.get(1)
+            q3 = task_queue._queues.get(3)
+            if q1 and q3:
+                # 交换内容
+                task_queue._queues[1], task_queue._queues[3] = q3, q1
+                logger.warning("EXPLORATION: Swapped Priority 1 and 3 Queues!")
+
+    def _apply_queue_shuffle(self, task_queue):
+        """随机打乱所有队列的顺序"""
+        import random
+        for p_level, deque_obj in task_queue._queues.items():
+            if len(deque_obj) > 1:
+                temp_list = list(deque_obj)
+                random.shuffle(temp_list)
+                task_queue._queues[p_level] = type(deque_obj)(temp_list)
+
     def get_training_statistics(self) -> Dict[str, Any]:
         """
         Get RL training statistics.

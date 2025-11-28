@@ -75,9 +75,10 @@ class SimulationConfig:
     """Names of state variables for debugging and monitoring"""
     
     # ==================== RL Configuration ====================
-    RL_ACTION_DIM: int = 4
+    RL_ACTION_DIM: int = 3 + 3  # = 6
     """Dimension of action space (sampling period, priority, energy threshold, node count)"""
-    
+
+
     # ==================== Data Logging Configuration ====================
     ENABLE_LOGGING: bool = True
     """Enable detailed logging"""

@@ -158,7 +158,9 @@ class MaestroSimulator:
     def _get_next_event_time(self) -> float:
         """Determine the next event time (task arrival or sample time)"""
         # Next scheduled sampling time
-        next_sample_time = self.current_time + self.config.SAMPLING_PERIOD
+        # 从接口获取当前实际的采样周期
+        current_period = self.simulink_interface.sampling_period
+        next_sample_time = self.current_time + current_period
         
         # Next task arrival time
         next_task_type, next_task_time = self.task_manager.get_next_task_arrival_time()
@@ -355,7 +357,12 @@ class MaestroSimulator:
         action = self.rl_interface.select_action(state)
 
         # Apply RL action
-        self.rl_interface.apply_action(action, self.task_manager, self.simulink_interface)
+        self.rl_interface.apply_action(
+            action,
+            self.task_manager,
+            self.simulink_interface,
+            self.task_queue
+        )
 
         # Process tasks
         tasks_executed, tasks_failed = self._process_tasks()

@@ -33,22 +33,26 @@ def main():
     try:
         # 2. 加载配置
         config = SimulationConfig()
-
-        # [新增 2] 开启轨迹保存功能 (离线 RL 必需)
-        # 这样 simulator.py 的 cleanup() 才会把数据写入硬盘
         config.SAVE_TRAJECTORY = True
-        # 可选：调整仿真时长
-        # config.SIMULATION_DURATION = 1000.0
 
-        # [新增 3] 实例化行为代理 (80% Frugal + 20% Random)
+        # 1. 获取任务类型列表 (确保顺序一致性)
+        # config.TASK_TYPES 默认为 ["sampling", "computing", "communication"]
+        task_types_list = config.TASK_TYPES
+
         # 定义动作空间的物理边界 (需根据 Simulink 参数范围调整)
         action_limits = {
-            'sampling_period': (0.5, 5.0),  # 采样周期范围 (秒)
+            'sampling_period': (0.1, 3.0),  # 采样周期范围 (秒)
             'energy_threshold': (1.8, 3.8),  # 能量阈值范围 (V)
             'required_nodes': (1, 5),  # 所需节点数范围
             'priority_levels': [1, 2, 3]  # 优先级列表
         }
-        collector_agent = BehaviorAgent(action_space_limits=action_limits)
+
+        collector_agent = BehaviorAgent(
+            action_space_limits=action_limits,
+            task_types=task_types_list  # [关键修复] 补上这个参数
+        )
+
+        # 这样 simulator.py 的 cleanup() 才会把数据写入硬盘
 
         # 3. 初始化仿真器并注入代理
         # 注意：这里假设你已经修改了 simulator.py 的 __init__ 以接收 agent 参数
@@ -57,6 +61,8 @@ def main():
         # 【备选方案】如果你还没有修改 simulator.py 的 __init__，请使用下面这种“手动注入”方式：
         sim = MaestroSimulator(config, rl_enabled=True)
         sim.rl_interface.rl_agent = collector_agent
+        collector_agent.bind_task_queue(sim.task_queue)
+
         sim.rl_interface.enabled = True
         logger.info(f"Agent injected: {type(collector_agent).__name__}")
 
